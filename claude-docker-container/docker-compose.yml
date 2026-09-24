@@ -1,0 +1,27 @@
+services:
+  claude-teams:
+    build: .
+    container_name: claude-teams
+    hostname: claude-teams
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - claude-config:/home/node/.claude
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOST_CMUX_SOCK:-${HOME}/.local/state/cmux/cmux-501.sock}:/var/run/cmux.sock
+    environment:
+      - CONTAINER_NAME=claude-teams
+      - CMUX_SOCKET_PATH=/var/run/cmux.sock
+      - CMUX_SOCKET_CAPABILITY=${CMUX_SOCKET_CAPABILITY:-}
+      - CMUX_WORKSPACE_ID=${CMUX_WORKSPACE_ID:-}
+      - CMUX_SURFACE_ID=${CMUX_SURFACE_ID:-}
+      - TMUX=/tmp/fake-tmux-sock,0,0
+      - CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+
+volumes:
+  claude-config:

@@ -1,0 +1,7 @@
+worktrees/
+.vscode
+.DS_Store
+.rtk/
+.agents/
+CLAUDE.md
+GEMINI.md
