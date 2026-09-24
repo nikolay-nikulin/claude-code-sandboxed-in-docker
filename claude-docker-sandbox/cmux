@@ -1,0 +1,424 @@
+#!/usr/bin/env node
+/**
+ * cmux CLI client for Linux / container environments.
+ * Connects to the cmux Unix domain socket (mounted from host)
+ * and supports split, new-split, new-window, send, ping, and json-rpc.
+ */
+
+const net = require('net');
+const process = require('process');
+const fs = require('fs');
+const path = require('path');
+
+function resolveSocketPath() {
+  // 1. Direct environment variable overrides
+  for (const envVar of [process.env.CMUX_SOCKET_PATH, process.env.HOST_CMUX_SOCK]) {
+    if (envVar && fs.existsSync(envVar)) {
+      return envVar;
+    }
+  }
+
+  // 2. Direct well-known socket file locations
+  const directSockets = [
+    '/var/run/cmux.sock',
+    '/run/cmux.sock',
+    '/tmp/cmux.sock',
+  ];
+  for (const sockPath of directSockets) {
+    if (fs.existsSync(sockPath)) {
+      return sockPath;
+    }
+  }
+
+  // 3. Build candidate directories dynamically
+  const candidateDirs = new Set();
+  if (process.env.CMUX_DIR) candidateDirs.add(process.env.CMUX_DIR);
+  if (process.env.CMUX_STATE_DIR) candidateDirs.add(process.env.CMUX_STATE_DIR);
+  if (process.env.XDG_STATE_HOME) candidateDirs.add(path.join(process.env.XDG_STATE_HOME, 'cmux'));
+  if (process.env.XDG_RUNTIME_DIR) candidateDirs.add(path.join(process.env.XDG_RUNTIME_DIR, 'cmux'));
+
+  const home = process.env.HOME;
+  if (home) {
+    candidateDirs.add(path.join(home, '.local/state/cmux'));
+    candidateDirs.add(path.join(home, '.cmux'));
+  }
+
+  // Inspect host user directories dynamically if mounted (e.g. macOS /Users/* or Linux /home/*)
+  for (const parent of ['/Users', '/home']) {
+    if (fs.existsSync(parent)) {
+      try {
+        const entries = fs.readdirSync(parent);
+        for (const entry of entries) {
+          if (entry.startsWith('.')) continue;
+          candidateDirs.add(path.join(parent, entry, '.local/state/cmux'));
+          candidateDirs.add(path.join(parent, entry, '.cmux'));
+        }
+      } catch (e) {}
+    }
+  }
+
+  candidateDirs.add('/var/run');
+  candidateDirs.add('/run');
+  candidateDirs.add('/tmp');
+
+  for (const dir of candidateDirs) {
+    if (!fs.existsSync(dir)) continue;
+    const lastPath = path.join(dir, 'last-socket-path');
+    if (fs.existsSync(lastPath)) {
+      try {
+        const target = fs.readFileSync(lastPath, 'utf8').trim();
+        if (fs.existsSync(target)) return target;
+      } catch (e) {}
+    }
+    try {
+      const files = fs.readdirSync(dir);
+      const isDedicatedCmuxDir = path.basename(dir) === 'cmux' || dir.includes('.cmux');
+      const sock = files.find(f => {
+        if (!f.endsWith('.sock') || f.endsWith('.lock')) return false;
+        return isDedicatedCmuxDir ? true : f.includes('cmux');
+      });
+      if (sock) return path.join(dir, sock);
+    } catch (e) {}
+  }
+  return process.env.CMUX_SOCKET_PATH || '/var/run/cmux.sock';
+}
+
+const socketPath = resolveSocketPath();
+const capability = process.env.CMUX_SOCKET_CAPABILITY || '';
+
+function printUsage() {
+  console.log(`cmux - container CLI client for cmux host socket
+
+Usage:
+  cmux ping
+  cmux split [-h|-v] [left|right|up|down] [-- <command...>]
+  cmux new-split <left|right|up|down> [--command <cmd>]
+  cmux new-window [-- <command...>]
+  cmux send <text>
+  cmux send-keys <key>
+  cmux list-panes
+  cmux close-surface <id>
+  cmux identify
+`);
+}
+
+function sendRaw(payload, callback) {
+  let finished = false;
+  const client = net.createConnection(socketPath, () => {
+    let wire = payload;
+    if (capability && !wire.startsWith('_cmux_capability_v1 ')) {
+      wire = `_cmux_capability_v1 ${capability} ${payload}`;
+    }
+    client.write(wire + '\n');
+  });
+
+  let output = '';
+  client.on('data', (chunk) => {
+    output += chunk.toString();
+    if (output.includes('\n')) {
+      if (!finished) {
+        finished = true;
+        client.destroy();
+        callback(null, output);
+      }
+    }
+  });
+
+  client.on('end', () => {
+    if (!finished) {
+      finished = true;
+      callback(null, output);
+    }
+  });
+
+  client.on('error', (err) => {
+    if (!finished) {
+      finished = true;
+      callback(err);
+    }
+  });
+
+  setTimeout(() => {
+    if (!finished) {
+      finished = true;
+      client.destroy();
+      callback(null, output);
+    }
+  }, 3000);
+}
+
+function sendJsonRpc(method, params, callback) {
+  const id = 'cmux-' + Math.random().toString(36).substring(2, 10);
+  const req = {
+    id,
+    method,
+    params: params || {}
+  };
+  sendRaw(JSON.stringify(req), (err, res) => {
+    if (err) return callback(err);
+    try {
+      const parsed = JSON.parse(res.trim());
+      if (parsed.ok === false) {
+        const errMsg = (parsed.error && parsed.error.message) || JSON.stringify(parsed.error);
+        return callback(new Error(`cmux RPC error [${method}]: ${errMsg}`));
+      }
+      callback(null, parsed.result);
+    } catch (e) {
+      callback(null, res.trim());
+    }
+  });
+}
+
+const args = process.argv.slice(2);
+if (args.length === 0) {
+  printUsage();
+  process.exit(1);
+}
+
+const cmd = args[0];
+
+switch (cmd) {
+  case 'ping': {
+    sendRaw('ping', (err, res) => {
+      if (err) {
+        console.error('Error connecting to cmux socket:', err.message);
+        process.exit(1);
+      }
+      console.log(res.trim());
+    });
+    break;
+  }
+
+  case 'split':
+  case 'new-split': {
+    let direction = 'right';
+    let commandTokens = [];
+    let i = 1;
+
+    while (i < args.length) {
+      const arg = args[i];
+      if (arg === '--') {
+        commandTokens = args.slice(i + 1);
+        break;
+      } else if (arg === '-h') {
+        direction = 'right';
+        i++;
+      } else if (arg === '-v') {
+        direction = 'down';
+        i++;
+      } else if (arg === '--command') {
+        commandTokens = [args[i + 1]];
+        i += 2;
+      } else if (['left', 'right', 'up', 'down'].includes(arg)) {
+        direction = arg;
+        i++;
+      } else {
+        commandTokens.push(arg);
+        i++;
+      }
+    }
+
+    const commandStr = commandTokens.join(' ').trim();
+    const params = {
+      direction: direction,
+      focus: true
+    };
+
+    if (process.env.CMUX_WORKSPACE_ID) {
+      params.workspace_id = process.env.CMUX_WORKSPACE_ID;
+    }
+    if (process.env.CMUX_SURFACE_ID) {
+      params.surface_id = process.env.CMUX_SURFACE_ID;
+    }
+
+    sendJsonRpc('surface.split', params, (err, res) => {
+      if (err) {
+        console.error('cmux split error:', err.message);
+        process.exit(1);
+      }
+      const surfaceId = (typeof res === 'object' && res !== null) ? (res.surface_id || res.surface_ref) : res;
+      if (typeof res === 'object' && res !== null) {
+        console.log(res.surface_ref || res.surface_id || JSON.stringify(res));
+      } else {
+        console.log(res);
+      }
+
+      if (commandStr && surfaceId) {
+        setTimeout(() => {
+          // Send Ctrl+C and Ctrl+U to discard any partially initialized prompt/plugin input
+          sendJsonRpc('surface.send_text', {
+            surface_id: surfaceId,
+            text: '\x03\x15'
+          }, () => {
+            setTimeout(() => {
+              sendJsonRpc('surface.send_text', {
+                surface_id: surfaceId,
+                text: commandStr + '\n'
+              }, (sendErr) => {
+                if (sendErr) {
+                  console.error('cmux send_text error:', sendErr.message);
+                }
+              });
+            }, 100);
+          });
+        }, 1200);
+      }
+    });
+    break;
+  }
+
+  case 'new-window': {
+    let commandTokens = [];
+    let i = 1;
+    while (i < args.length) {
+      if (args[i] === '--') {
+        commandTokens = args.slice(i + 1);
+        break;
+      }
+      commandTokens.push(args[i]);
+      i++;
+    }
+
+    const commandStr = commandTokens.join(' ').trim();
+    const params = {
+      direction: 'right',
+      focus: true
+    };
+    if (process.env.CMUX_WORKSPACE_ID) {
+      params.workspace_id = process.env.CMUX_WORKSPACE_ID;
+    }
+
+    sendJsonRpc('surface.split', params, (err, res) => {
+      if (err) {
+        console.error('cmux new-window error:', err.message);
+        process.exit(1);
+      }
+      const surfaceId = (typeof res === 'object' && res !== null) ? (res.surface_id || res.surface_ref) : res;
+      if (typeof res === 'object' && res !== null) {
+        console.log(res.surface_ref || res.surface_id || JSON.stringify(res));
+      } else {
+        console.log(res);
+      }
+
+      if (commandStr && surfaceId) {
+        setTimeout(() => {
+          // Send Ctrl+C and Ctrl+U to discard any partially initialized prompt/plugin input
+          sendJsonRpc('surface.send_text', {
+            surface_id: surfaceId,
+            text: '\x03\x15'
+          }, () => {
+            setTimeout(() => {
+              sendJsonRpc('surface.send_text', {
+                surface_id: surfaceId,
+                text: commandStr + '\n'
+              }, (sendErr) => {
+                if (sendErr) {
+                  console.error('cmux send_text error:', sendErr.message);
+                }
+              });
+            }, 100);
+          });
+        }, 1200);
+      }
+    });
+    break;
+  }
+
+  case 'send':
+  case 'send-keys': {
+    const text = args.slice(1).join(' ');
+    sendRaw(`send ${text}`, (err, res) => {
+      if (err) {
+        console.error('cmux send error:', err.message);
+        process.exit(1);
+      }
+      if (res.trim()) console.log(res.trim());
+    });
+    break;
+  }
+
+  case 'list-panes': {
+    sendJsonRpc('pane.list', {}, (err, res) => {
+      if (err) {
+        console.error('cmux list-panes error:', err.message);
+        process.exit(1);
+      }
+      console.log(typeof res === 'object' ? JSON.stringify(res, null, 2) : res);
+    });
+    break;
+  }
+
+  case 'close-surface':
+  case 'kill-pane': {
+    const target = args[1] || process.env.CMUX_SURFACE_ID;
+    if (!target) {
+      console.error('Usage: cmux close-surface <surface_id>');
+      process.exit(1);
+    }
+    const params = { surface_id: target };
+    if (process.env.CMUX_WORKSPACE_ID) {
+      params.workspace_id = process.env.CMUX_WORKSPACE_ID;
+    }
+    sendJsonRpc('surface.close', params, (err, res) => {
+      if (err) {
+        // Fallback: try resolving surface_ref to surface_id UUID via pane.list
+        sendJsonRpc('pane.list', {}, (listErr, listRes) => {
+          if (!listErr && listRes && Array.isArray(listRes.panes)) {
+            for (const p of listRes.panes) {
+              const refs = p.surface_refs || [];
+              const ids = p.surface_ids || [];
+              if (refs.includes(target) || ids.includes(target) || p.selected_surface_ref === target) {
+                const uuid = p.selected_surface_id || (ids.length > 0 ? ids[0] : null);
+                if (uuid && uuid !== target) {
+                  const retryParams = { surface_id: uuid };
+                  if (process.env.CMUX_WORKSPACE_ID) retryParams.workspace_id = process.env.CMUX_WORKSPACE_ID;
+                  sendJsonRpc('surface.close', retryParams, (retryErr) => {
+                    if (retryErr) {
+                      console.error('cmux close-surface retry error:', retryErr.message);
+                      process.exit(1);
+                    }
+                    console.log('OK');
+                  });
+                  return;
+                }
+              }
+            }
+          }
+          console.error('cmux close-surface error:', err.message);
+          process.exit(1);
+        });
+        return;
+      }
+      console.log('OK');
+    });
+    break;
+  }
+
+  case 'identify': {
+    sendJsonRpc('workspace.list', {}, (err, res) => {
+      if (err) {
+        console.error('cmux identify error:', err.message);
+        process.exit(1);
+      }
+      console.log(typeof res === 'object' ? JSON.stringify(res, null, 2) : res);
+    });
+    break;
+  }
+
+  case 'help':
+  case '--help':
+  case '-h': {
+    printUsage();
+    break;
+  }
+
+  default: {
+    sendRaw(args.join(' '), (err, res) => {
+      if (err) {
+        console.error('cmux error:', err.message);
+        process.exit(1);
+      }
+      console.log(res.trim());
+    });
+  }
+}

@@ -1,0 +1,13 @@
+schemaVersion: "1"
+name: claude-teams-sbx
+agent: claude
+workspace: .
+additionalWorkspaces:
+  - path: ~/.local/state/cmux
+env:
+  CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "1"
+  TMUX: "/tmp/fake-tmux-sock,0,0"
+  SANDBOX_NAME: "claude-teams-sbx"
+lifecycle:
+  postCreate:
+    - command: "mkdir -p /home/agent/.local/bin && cp ./tmux-cmux-shim.sh /home/agent/.local/bin/tmux && chmod +x /home/agent/.local/bin/tmux && cp ./cmux /home/agent/.local/bin/cmux && chmod +x /home/agent/.local/bin/cmux"
